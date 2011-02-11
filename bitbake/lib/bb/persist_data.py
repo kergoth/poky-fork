@@ -28,17 +28,13 @@ import sys
 import warnings
 import bb.msg, bb.data, bb.utils
 
-try:
-    import sqlite3
-except ImportError:
-    from pysqlite2 import dbapi2 as sqlite3
-
-sqlversion = sqlite3.sqlite_version_info
-if sqlversion[0] < 3 or (sqlversion[0] == 3 and sqlversion[1] < 3):
-    raise Exception("sqlite3 version 3.3.0 or later is required.")
+import sqlite3
+if sqlite3.sqlite_version_info < [3, 3, 0]:
+    raise ImportError("sqlite3 version 3.3.0 or later is required.")
 
 
 logger = logging.getLogger("BitBake.PersistData")
+sqlite3.enable_shared_cache(True)
 
 
 class SQLTable(collections.MutableMapping):
@@ -51,24 +47,28 @@ class SQLTable(collections.MutableMapping):
                       % table)
 
     def _execute(self, *query):
-        """Execute a query, waiting to acquire a lock if necessary"""
-        count = 0
-        while True:
-            try:
-                return self.cursor.execute(*query)
-            except sqlite3.OperationalError as exc:
-                if 'database is locked' in str(exc) and count < 500:
-                    count = count + 1
-                    continue
-                raise
+        return self.cursor.execute(*query)
+
+    def __enter__(self):
+        self.cursor.__enter__()
+        return self
+
+    def __exit__(self, *excinfo):
+        self.cursor.__exit__(*excinfo)
 
     def __getitem__(self, key):
         data = self._execute("SELECT * from %s where key=?;" %
                              self.table, [key])
-        for row in data:
-            return row[1]
+        row = data.fetchone()
+        if not row:
+            raise KeyError(key)
+
+        return row[1]
 
     def __delitem__(self, key):
+        if not key in self:
+            raise KeyError(key)
+
         self._execute("DELETE from %s where key=?;" % self.table, [key])
 
     def __setitem__(self, key, value):
@@ -92,46 +92,23 @@ class SQLTable(collections.MutableMapping):
 
     def __iter__(self):
         data = self._execute("SELECT key FROM %s;" % self.table)
-        for row in data:
-            yield row[0]
+        return (row[0] for row in data)
 
-    def iteritems(self):
-        data = self._execute("SELECT * FROM %s;" % self.table)
-        for row in data:
-            yield row[0], row[1]
+    def values(self):
+        return list(self.itervalues())
 
     def itervalues(self):
         data = self._execute("SELECT value FROM %s;" % self.table)
-        for row in data:
-            yield row[0]
+        return (row[0] for row in data)
 
+    def items(self):
+        return list(self.iteritems())
 
-class SQLData(object):
-    """Object representing the persistent data"""
-    def __init__(self, filename):
-        bb.utils.mkdirhier(os.path.dirname(filename))
+    def iteritems(self):
+        return self._execute("SELECT * FROM %s;" % self.table)
 
-        self.filename = filename
-        self.connection = sqlite3.connect(filename, timeout=5,
-                                          isolation_level=None)
-        self.cursor = self.connection.cursor()
-        self._tables = {}
-
-    def __getitem__(self, table):
-        if not isinstance(table, basestring):
-            raise TypeError("table argument must be a string, not '%s'" %
-                            type(table))
-
-        if table in self._tables:
-            return self._tables[table]
-        else:
-            tableobj = self._tables[table] = SQLTable(self.cursor, table)
-            return tableobj
-
-    def __delitem__(self, table):
-        if table in self._tables:
-            del self._tables[table]
-        self.cursor.execute("DROP TABLE IF EXISTS %s;" % table)
+    def clear(self):
+        self._execute("DELETE FROM %s;" % self.table)
 
 
 class PersistData(object):
@@ -181,14 +158,18 @@ class PersistData(object):
         """
         del self.data[domain][key]
 
+def connect(database):
+    return sqlite3.connect(database, timeout=30, isolation_level=None)
 
-def persist(d):
-    """Convenience factory for construction of SQLData based upon metadata"""
+def persist(domain, d):
+    """Convenience factory for SQLTable objects based upon metadata"""
     cachedir = (bb.data.getVar("PERSISTENT_DIR", d, True) or
                 bb.data.getVar("CACHE", d, True))
     if not cachedir:
         logger.critical("Please set the 'PERSISTENT_DIR' or 'CACHE' variable")
         sys.exit(1)
 
+    bb.utils.mkdirhier(cachedir)
     cachefile = os.path.join(cachedir, "bb_persist_data.sqlite3")
-    return SQLData(cachefile)
+    connection = connect(cachefile)
+    return SQLTable(connection, domain)
